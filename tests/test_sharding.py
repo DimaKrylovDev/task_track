@@ -3,6 +3,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from app.cli.migrate_to_four_shards import migrate_batch
 from app.cli.sharding import simulation
 from app.db.sharded_users import ShardedUser, merge_user_pages
 from app.db.sharding import (
@@ -71,3 +72,23 @@ def test_distributed_order_merge_uses_global_order_and_limit() -> None:
     result = merge_user_pages((candidates[:1], candidates[1:]), limit=2)
 
     assert [user.display_name for user in result] == ["Anna", "Mike"]
+
+
+async def test_migration_dry_run_counts_only_keys_that_change_shard() -> None:
+    old_router = ModuloHashRouter(("shard-0", "shard-1", "shard-2"))
+    new_router = ModuloHashRouter(("shard-0", "shard-1", "shard-2", "shard-3"))
+    source = "shard-0"
+    source_keys = [key for key in keys(100) if old_router.route(key) == source]
+    rows = [{"id": key} for key in source_keys]
+    expected = sum(new_router.route(key) != source for key in source_keys)
+
+    moved = await migrate_batch(
+        store=None,  # type: ignore[arg-type]
+        old_router=old_router,
+        new_router=new_router,
+        source=source,
+        rows=rows,
+        dry_run=True,
+    )
+
+    assert moved == expected
