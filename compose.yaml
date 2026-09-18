@@ -1,0 +1,240 @@
+x-partition-environment: &partition-environment
+  DATABASE_URL: postgresql+asyncpg://tracker:tracker@postgres-primary:5432/tracker
+  REPLICA_DATABASE_URL: postgresql+asyncpg://tracker:tracker@postgres-replica:5432/tracker
+  JWT_SECRET: local-development-secret-change-in-production
+  CELERY_BROKER_URL: redis://redis:6379/0
+  PARTITION_ALERT_WEBHOOK_URL: "${PARTITION_ALERT_WEBHOOK_URL:-}"
+  TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+  TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+
+services:
+  postgres-primary:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator-password
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=256MB
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./docker/postgres/primary/init-replication.sh:/docker-entrypoint-initdb.d/10-init-replication.sh:ro
+    ports:
+      - "56432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-replica:
+    image: postgres:17-alpine
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: tracker
+      POSTGRES_DB: tracker
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator-password
+      PRIMARY_HOST: postgres-primary
+    entrypoint: ["/usr/local/bin/replica-entrypoint.sh"]
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./docker/postgres/replica/entrypoint.sh:/usr/local/bin/replica-entrypoint.sh:ro
+    ports:
+      - "56433:5432"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker && test \"$(psql -U tracker -d tracker -Atqc 'SELECT pg_is_in_recovery()')\" = t"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres-replica-2:
+    image: postgres:17-alpine
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: tracker
+      POSTGRES_DB: tracker
+      REPLICATION_USER: replicator-user
+      REPLICATION_PASSWORD: replicator-password-2
+      PRIMARY_HOST: postgres-primary
+    entrypoint: ["/usr/local/bin/replica-entrypoint.sh"]
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./docker/postgres/replica/entrypoint.sh:/usr/local/bin/replica-entrypoint.sh:ro
+    ports:
+      - "56434:5432"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker && test \"$(psql -U tracker -d tracker -Atqc 'SELECT pg_is_in_recovery()')\" = t"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres-shard-0:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+    volumes:
+      - postgres_shard_0_data:/var/lib/postgresql/data
+    ports:
+      - "56540:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-shard-1:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+    volumes:
+      - postgres_shard_1_data:/var/lib/postgresql/data
+    ports:
+      - "56541:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-shard-2:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+    volumes:
+      - postgres_shard_2_data:/var/lib/postgresql/data
+    ports:
+      - "56542:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-shard-3:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: tracker
+      POSTGRES_USER: tracker
+      POSTGRES_PASSWORD: tracker
+    volumes:
+      - postgres_shard_3_data:/var/lib/postgresql/data
+    ports:
+      - "56543:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db-migrate:
+    build: .
+    environment: *partition-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+
+  celery-worker:
+    build: .
+    restart: unless-stopped
+    environment: *partition-environment
+    command: ["celery", "-A", "app.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1", "--queues=partition-maintenance"]
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  celery-beat:
+    build: .
+    restart: unless-stopped
+    environment: *partition-environment
+    command: ["celery", "-A", "app.celery_app:celery_app", "beat", "--loglevel=INFO", "--schedule=/var/lib/celery/celerybeat-schedule"]
+    volumes:
+      - celery_beat_data:/var/lib/celery
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  backend:
+    build: .
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://tracker:tracker@postgres-primary:5432/tracker
+      REPLICA_DATABASE_URL: postgresql+asyncpg://tracker:tracker@postgres-replica:5432/tracker
+      SHARD_DATABASE_URLS: '["postgresql+asyncpg://tracker:tracker@postgres-shard-0:5432/tracker","postgresql+asyncpg://tracker:tracker@postgres-shard-1:5432/tracker","postgresql+asyncpg://tracker:tracker@postgres-shard-2:5432/tracker","postgresql+asyncpg://tracker:tracker@postgres-shard-3:5432/tracker"]'
+      JWT_SECRET: local-development-secret-change-in-production
+      ACCESS_TOKEN_MINUTES: 15
+      REFRESH_TOKEN_DAYS: 30
+      SQL_ECHO: "false"
+      PARTITION_ALERT_WEBHOOK_URL: "${PARTITION_ALERT_WEBHOOK_URL:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+      postgres-replica:
+        condition: service_healthy
+
+  partition-maintenance:
+    profiles: ["maintenance"]
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://tracker:tracker@postgres-primary:5432/tracker
+      REPLICA_DATABASE_URL: postgresql+asyncpg://tracker:tracker@postgres-replica:5432/tracker
+      JWT_SECRET: local-development-secret-change-in-production
+      PARTITION_ALERT_WEBHOOK_URL: "${PARTITION_ALERT_WEBHOOK_URL:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli.partitions create && python -m app.cli.partitions check"]
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+
+volumes:
+  postgres_primary_data:
+  postgres_replica_data:
+  postgres_shard_0_data:
+  postgres_shard_1_data:
+  postgres_shard_2_data:
+  postgres_shard_3_data:
+  redis_data:
+  celery_beat_data:
